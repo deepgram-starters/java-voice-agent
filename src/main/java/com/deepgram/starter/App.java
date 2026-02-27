@@ -28,8 +28,8 @@ import io.javalin.Javalin;
 import io.javalin.websocket.WsConfig;
 import io.javalin.websocket.WsContext;
 import org.eclipse.jetty.websocket.client.WebSocketClient;
-import org.eclipse.jetty.websocket.api.Callback;
 import org.eclipse.jetty.websocket.api.Session;
+import org.eclipse.jetty.websocket.api.StatusCode;
 import org.eclipse.jetty.websocket.api.annotations.*;
 
 import java.io.File;
@@ -74,8 +74,8 @@ public class App {
     /** Tracks all active client WebSocket contexts for graceful shutdown. */
     private static final Set<WsContext> activeConnections = ConcurrentHashMap.newKeySet();
 
-    /** Tracks Deepgram sessions keyed by client session ID for cleanup. */
-    private static final Map<String, DeepgramSession> deepgramSessions = new ConcurrentHashMap<>();
+    /** Tracks Deepgram sessions keyed by client WsContext for cleanup. */
+    private static final Map<WsContext, DeepgramSession> deepgramSessions = new ConcurrentHashMap<>();
 
     /** Shared Jetty WebSocket client for outbound Deepgram connections. */
     private static WebSocketClient wsClient;
@@ -183,22 +183,19 @@ public class App {
     public static class DeepgramSession {
         private WsContext clientCtx;
         private Session deepgramSession;
-        private String sessionId;
 
         public DeepgramSession() {}
 
         /**
          * Sets the client context for bidirectional message forwarding.
          *
-         * @param ctx    the Javalin WebSocket context
-         * @param sessId unique session identifier for tracking
+         * @param ctx the Javalin WebSocket context
          */
-        public void setClientContext(WsContext ctx, String sessId) {
+        public void setClientContext(WsContext ctx) {
             this.clientCtx = ctx;
-            this.sessionId = sessId;
         }
 
-        @OnWebSocketOpen
+        @OnWebSocketConnect
         public void onOpen(Session session) {
             this.deepgramSession = session;
             System.out.println("Connected to Deepgram Agent API");
@@ -217,18 +214,17 @@ public class App {
         }
 
         @OnWebSocketMessage
-        public void onBinaryMessage(Session session, ByteBuffer payload, Callback callback) {
+        public void onBinaryMessage(byte[] payload, int offset, int len) {
             // Forward binary audio from Deepgram to client
             if (clientCtx != null) {
                 try {
-                    byte[] data = new byte[payload.remaining()];
-                    payload.get(data);
+                    byte[] data = new byte[len];
+                    System.arraycopy(payload, offset, data, 0, len);
                     clientCtx.send(ByteBuffer.wrap(data));
                 } catch (Exception e) {
                     System.err.println("Error forwarding binary to client: " + e.getMessage());
                 }
             }
-            callback.succeed();
         }
 
         @OnWebSocketError
@@ -259,7 +255,6 @@ public class App {
                     System.err.println("Error closing client connection: " + e.getMessage());
                 }
             }
-            cleanup();
         }
 
         /**
@@ -269,7 +264,11 @@ public class App {
          */
         public void sendText(String message) {
             if (deepgramSession != null && deepgramSession.isOpen()) {
-                deepgramSession.sendText(message, Callback.NOOP);
+                try {
+                    deepgramSession.getRemote().sendString(message);
+                } catch (Exception e) {
+                    System.err.println("Error sending text to Deepgram: " + e.getMessage());
+                }
             }
         }
 
@@ -280,7 +279,11 @@ public class App {
          */
         public void sendBinary(ByteBuffer data) {
             if (deepgramSession != null && deepgramSession.isOpen()) {
-                deepgramSession.sendBinary(data, Callback.NOOP);
+                try {
+                    deepgramSession.getRemote().sendBytes(data);
+                } catch (Exception e) {
+                    System.err.println("Error sending binary to Deepgram: " + e.getMessage());
+                }
             }
         }
 
@@ -289,15 +292,10 @@ public class App {
          */
         public void close() {
             if (deepgramSession != null && deepgramSession.isOpen()) {
-                deepgramSession.close(1000, "Client disconnected", Callback.NOOP);
+                deepgramSession.close(StatusCode.NORMAL, "Client disconnected");
             }
         }
 
-        private void cleanup() {
-            if (sessionId != null) {
-                deepgramSessions.remove(sessionId);
-            }
-        }
     }
 
     // ============================================================================
@@ -350,13 +348,11 @@ public class App {
             System.out.println("Client connected to /api/voice-agent");
             activeConnections.add(ctx);
 
-            String sessionId = ctx.getSessionId();
-
             try {
                 // Create Deepgram session handler
                 DeepgramSession dgSession = new DeepgramSession();
-                dgSession.setClientContext(ctx, sessionId);
-                deepgramSessions.put(sessionId, dgSession);
+                dgSession.setClientContext(ctx);
+                deepgramSessions.put(ctx, dgSession);
 
                 // Connect to Deepgram Voice Agent API with auth header
                 System.out.println("Initiating Deepgram connection...");
@@ -384,28 +380,29 @@ public class App {
 
         // Forward text messages from client to Deepgram
         ws.onMessage(ctx -> {
-            String sessionId = ctx.getSessionId();
-            DeepgramSession dgSession = deepgramSessions.get(sessionId);
+            DeepgramSession dgSession = deepgramSessions.get(ctx);
             if (dgSession != null) {
                 dgSession.sendText(ctx.message());
             }
         });
 
         // Forward binary messages from client to Deepgram
-        ws.onBinaryMessage((ctx, data, offset, length) -> {
-            String sessionId = ctx.getSessionId();
-            DeepgramSession dgSession = deepgramSessions.get(sessionId);
+        ws.onBinaryMessage(ctx -> {
+            DeepgramSession dgSession = deepgramSessions.get(ctx);
             if (dgSession != null) {
-                ByteBuffer buffer = ByteBuffer.wrap(data, offset, length);
-                dgSession.sendBinary(buffer);
+                byte[] data = ctx.data();
+                int offset = ctx.offset();
+                int length = ctx.length();
+                byte[] bytes = new byte[length];
+                System.arraycopy(data, offset, bytes, 0, length);
+                dgSession.sendBinary(ByteBuffer.wrap(bytes));
             }
         });
 
         // Handle client disconnect
         ws.onClose(ctx -> {
             System.out.println("Client disconnected: " + ctx.status() + " " + ctx.reason());
-            String sessionId = ctx.getSessionId();
-            DeepgramSession dgSession = deepgramSessions.remove(sessionId);
+            DeepgramSession dgSession = deepgramSessions.remove(ctx);
             if (dgSession != null) {
                 dgSession.close();
             }
@@ -416,8 +413,7 @@ public class App {
         ws.onError(ctx -> {
             System.err.println("Client WebSocket error: " +
                     (ctx.error() != null ? ctx.error().getMessage() : "unknown"));
-            String sessionId = ctx.getSessionId();
-            DeepgramSession dgSession = deepgramSessions.remove(sessionId);
+            DeepgramSession dgSession = deepgramSessions.remove(ctx);
             if (dgSession != null) {
                 dgSession.close();
             }

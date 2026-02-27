@@ -63,11 +63,18 @@
             <version>2.0.16</version>
         </dependency>
 
+        <!-- Kotlin stdlib: pin to 1.9.25 to resolve Javalin/java-dotenv conflict -->
+        <dependency>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-stdlib</artifactId>
+            <version>1.9.25</version>
+        </dependency>
+
         <!-- Jetty WebSocket client for outbound Deepgram connections -->
         <dependency>
             <groupId>org.eclipse.jetty.websocket</groupId>
-            <artifactId>jetty-websocket-jetty-client</artifactId>
-            <version>12.0.16</version>
+            <artifactId>websocket-jetty-client</artifactId>
+            <version>11.0.24</version>
         </dependency>
     </dependencies>
 
