@@ -21,6 +21,13 @@
     </properties>
 
     <dependencies>
+        <!-- Deepgram Java SDK (provides client.agent().v1().v1WebSocket()) -->
+        <dependency>
+            <groupId>com.deepgram</groupId>
+            <artifactId>deepgram-java-sdk</artifactId>
+            <version>0.7.1</version>
+        </dependency>
+
         <!-- Javalin web framework (lightweight, built on Jetty) -->
         <dependency>
             <groupId>io.javalin</groupId>
@@ -68,13 +75,6 @@
             <groupId>org.jetbrains.kotlin</groupId>
             <artifactId>kotlin-stdlib</artifactId>
             <version>1.9.25</version>
-        </dependency>
-
-        <!-- Jetty WebSocket client for outbound Deepgram connections -->
-        <dependency>
-            <groupId>org.eclipse.jetty.websocket</groupId>
-            <artifactId>websocket-jetty-client</artifactId>
-            <version>11.0.24</version>
         </dependency>
     </dependencies>
 
