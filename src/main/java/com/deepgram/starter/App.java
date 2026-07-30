@@ -24,15 +24,6 @@ import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.exceptions.JWTVerificationException;
 import com.deepgram.DeepgramClient;
 import com.deepgram.core.ObjectMappers;
-import com.deepgram.resources.agent.v1.types.AgentV1InjectAgentMessage;
-import com.deepgram.resources.agent.v1.types.AgentV1InjectUserMessage;
-import com.deepgram.resources.agent.v1.types.AgentV1KeepAlive;
-import com.deepgram.resources.agent.v1.types.AgentV1SendFunctionCallResponse;
-import com.deepgram.resources.agent.v1.types.AgentV1Settings;
-import com.deepgram.resources.agent.v1.types.AgentV1UpdateListen;
-import com.deepgram.resources.agent.v1.types.AgentV1UpdatePrompt;
-import com.deepgram.resources.agent.v1.types.AgentV1UpdateSpeak;
-import com.deepgram.resources.agent.v1.types.AgentV1UpdateThink;
 import com.deepgram.resources.agent.v1.websocket.V1WebSocketClient;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -44,6 +35,7 @@ import io.javalin.websocket.WsContext;
 import okio.ByteString;
 
 import java.io.File;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.security.SecureRandom;
 import java.time.Instant;
@@ -96,6 +88,36 @@ public class App {
      * (union deserializers registered, unknown properties tolerated).
      */
     private static final ObjectMapper agentMapper = ObjectMappers.JSON_MAPPER;
+
+    /**
+     * The set of client-originated agent control message {@code type}s this
+     * bridge forwards upstream. Anything else is ignored (the browser owns the
+     * agent protocol; this is just a transparent proxy).
+     */
+    private static final Set<String> FORWARDED_CLIENT_TYPES = Set.of(
+            "Settings", "UpdateSpeak", "UpdatePrompt", "UpdateListen", "UpdateThink",
+            "InjectUserMessage", "InjectAgentMessage", "FunctionCallResponse", "KeepAlive");
+
+    /**
+     * Reflective handle to the SDK's private {@code V1WebSocketClient.sendMessage(Object)},
+     * which serializes an arbitrary object with the SDK's own mapper and writes it
+     * on the underlying (reconnecting) socket. We reuse this raw send path to
+     * forward the browser's control messages <em>verbatim</em> (see
+     * {@link #forwardClientMessage}); the SDK exposes no public raw-send method.
+     */
+    private static final Method DG_SEND_MESSAGE = resolveDgSendMessage();
+
+    private static Method resolveDgSendMessage() {
+        try {
+            Method m = V1WebSocketClient.class.getDeclaredMethod("sendMessage", Object.class);
+            m.setAccessible(true);
+            return m;
+        } catch (Exception e) {
+            System.err.println("WARNING: could not resolve V1WebSocketClient.sendMessage(Object); "
+                    + "client control messages cannot be forwarded verbatim: " + e.getMessage());
+            return null;
+        }
+    }
 
     // ============================================================================
     // SESSION AUTH - JWT tokens for production security
@@ -187,9 +209,19 @@ public class App {
 
     /**
      * Forwards a JSON control message from the client to the Deepgram agent
-     * websocket. The message is dispatched to the matching SDK typed send method
-     * based on its {@code type} field; the typed object round-trips the client's
-     * JSON through the SDK's own serializer, preserving the wire payload.
+     * websocket <em>verbatim</em>.
+     *
+     * <p>The message is serialized straight from the parsed JSON tree, not
+     * round-tripped through the SDK's typed protocol classes (e.g.
+     * {@code AgentV1Settings}). Those types re-emit their own constant
+     * {@code type} discriminator <em>and</em> the incoming {@code type} they
+     * captured in their additional-properties bag, so a round trip produces a
+     * <b>duplicate {@code type}</b> key (at the top level and at nested union
+     * variants such as {@code agent.listen.provider}). Deepgram rejects such a
+     * payload with {@code UNPARSABLE_CLIENT_MESSAGE} and never emits
+     * {@code SettingsApplied}. Forwarding the browser's JSON as-is preserves the
+     * exact wire payload (a single {@code type} at every level) and honors the
+     * transparent-proxy contract, where the browser owns the agent protocol.
      *
      * @param dg      the Deepgram agent websocket client
      * @param message the raw JSON text received from the browser
@@ -198,37 +230,17 @@ public class App {
         try {
             JsonNode node = agentMapper.readTree(message);
             String type = node.path("type").asText("");
-            switch (type) {
-                case "Settings":
-                    dg.sendSettings(agentMapper.treeToValue(node, AgentV1Settings.class));
-                    break;
-                case "UpdateSpeak":
-                    dg.sendUpdateSpeak(agentMapper.treeToValue(node, AgentV1UpdateSpeak.class));
-                    break;
-                case "UpdatePrompt":
-                    dg.sendUpdatePrompt(agentMapper.treeToValue(node, AgentV1UpdatePrompt.class));
-                    break;
-                case "UpdateListen":
-                    dg.sendUpdateListen(agentMapper.treeToValue(node, AgentV1UpdateListen.class));
-                    break;
-                case "UpdateThink":
-                    dg.sendUpdateThink(agentMapper.treeToValue(node, AgentV1UpdateThink.class));
-                    break;
-                case "InjectUserMessage":
-                    dg.sendInjectUserMessage(agentMapper.treeToValue(node, AgentV1InjectUserMessage.class));
-                    break;
-                case "InjectAgentMessage":
-                    dg.sendInjectAgentMessage(agentMapper.treeToValue(node, AgentV1InjectAgentMessage.class));
-                    break;
-                case "FunctionCallResponse":
-                    dg.sendFunctionCallResponse(agentMapper.treeToValue(node, AgentV1SendFunctionCallResponse.class));
-                    break;
-                case "KeepAlive":
-                    dg.sendKeepAlive(agentMapper.treeToValue(node, AgentV1KeepAlive.class));
-                    break;
-                default:
-                    System.out.println("Ignoring unknown client message type: " + type);
+            if (!FORWARDED_CLIENT_TYPES.contains(type)) {
+                System.out.println("Ignoring unknown client message type: " + type);
+                return;
             }
+            if (DG_SEND_MESSAGE == null) {
+                System.err.println("Cannot forward client message; SDK raw-send path unavailable");
+                return;
+            }
+            // Hand the SDK's raw send path the parsed JSON tree so it serializes
+            // it verbatim (no typed re-serialization, no duplicated `type`).
+            DG_SEND_MESSAGE.invoke(dg, node);
         } catch (Exception e) {
             System.err.println("Error forwarding client message to Deepgram: " + e.getMessage());
         }
