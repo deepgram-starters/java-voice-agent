@@ -486,6 +486,23 @@ public class App {
             System.exit(1);
         }
 
+        // Fail fast if the reflective raw-send handle could not be resolved.
+        // forwardClientMessage relies on the SDK's private
+        // V1WebSocketClient.sendMessage(Object) to forward the browser's control
+        // messages (including the initial Settings) verbatim. Without it the
+        // server would still start and audio would flow, but Settings would
+        // never be forwarded, so the agent would never be configured and never
+        // speak — a silent failure. Refuse to start instead. (See S2: the typed
+        // public senders emit a duplicated `type` the agent rejects, which is
+        // why this reflection exists; remove it once the SDK exposes a public
+        // raw/verbatim send.)
+        if (DG_SEND_MESSAGE == null) {
+            System.err.println("ERROR: could not resolve the SDK's V1WebSocketClient.sendMessage(Object); "
+                    + "client control messages cannot be forwarded. This usually means the pinned "
+                    + "deepgram-java-sdk version changed that method's name/signature.");
+            System.exit(1);
+        }
+
         // Load optional configuration
         String portStr = dotenv.get("PORT", "8081");
         port = Integer.parseInt(portStr);
