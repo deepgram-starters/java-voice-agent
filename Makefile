@@ -32,6 +32,10 @@ help:
 check-prereqs:
 	@command -v git >/dev/null 2>&1 || { echo "git is required but not installed. Visit https://git-scm.com"; exit 1; }
 	@command -v java >/dev/null 2>&1 || { echo "java is required but not installed. Visit https://adoptium.net"; exit 1; }
+	@set -- $$(java --version); major=$${2%%.*}; \
+		if [ -z "$$major" ] || [ "$$major" -lt 21 ]; then \
+			echo "JDK 21 or later is required. Verify with: java --version"; exit 1; \
+		fi
 	@command -v mvn >/dev/null 2>&1 || { echo "mvn is required but not installed. Visit https://maven.apache.org"; exit 1; }
 	@echo "All prerequisites installed"
 
