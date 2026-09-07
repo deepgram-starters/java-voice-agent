@@ -82,21 +82,8 @@ public class App {
     /** Jackson ObjectMapper for local JSON serialization (metadata, error messages). */
     private static final ObjectMapper jsonMapper = new ObjectMapper();
 
-    /**
-     * The SDK's own configured mapper, used to (de)serialize agent protocol
-     * messages so client JSON round-trips exactly as the SDK would parse/emit it
-     * (union deserializers registered, unknown properties tolerated).
-     */
+    /** Parses browser JSON to a tree for the SDK's raw-send path. */
     private static final ObjectMapper agentMapper = ObjectMappers.JSON_MAPPER;
-
-    /**
-     * The set of client-originated agent control message {@code type}s this
-     * bridge forwards upstream. Anything else is ignored (the browser owns the
-     * agent protocol; this is just a transparent proxy).
-     */
-    private static final Set<String> FORWARDED_CLIENT_TYPES = Set.of(
-            "Settings", "UpdateSpeak", "UpdatePrompt", "UpdateListen", "UpdateThink",
-            "InjectUserMessage", "InjectAgentMessage", "FunctionCallResponse", "KeepAlive");
 
     /**
      * Reflective handle to the SDK's private {@code V1WebSocketClient.sendMessage(Object)},
@@ -224,18 +211,19 @@ public class App {
      * transparent-proxy contract, where the browser owns the agent protocol.
      *
      * @param dg      the Deepgram agent websocket client
+     * @param ctx     the browser websocket context
      * @param message the raw JSON text received from the browser
      */
-    private static void forwardClientMessage(V1WebSocketClient dg, String message) {
+    private static void forwardClientMessage(V1WebSocketClient dg, WsContext ctx, String message) {
         try {
             JsonNode node = agentMapper.readTree(message);
-            String type = node.path("type").asText("");
-            if (!FORWARDED_CLIENT_TYPES.contains(type)) {
-                System.out.println("Ignoring unknown client message type: " + type);
+            if (!node.isObject()) {
+                sendClientError(ctx, "Client message must be a JSON object", "INVALID_CLIENT_MESSAGE");
                 return;
             }
             if (DG_SEND_MESSAGE == null) {
                 System.err.println("Cannot forward client message; SDK raw-send path unavailable");
+                sendClientError(ctx, "Deepgram connection is unavailable", "CONNECTION_FAILED");
                 return;
             }
             // Hand the SDK's raw send path the parsed JSON tree so it serializes
@@ -243,6 +231,7 @@ public class App {
             DG_SEND_MESSAGE.invoke(dg, node);
         } catch (Exception e) {
             System.err.println("Error forwarding client message to Deepgram: " + e.getMessage());
+            sendClientError(ctx, "Failed to forward client message", "PROVIDER_ERROR");
         }
     }
 
@@ -386,7 +375,7 @@ public class App {
         ws.onMessage(ctx -> {
             V1WebSocketClient dg = deepgramSessions.get(ctx);
             if (dg != null) {
-                forwardClientMessage(dg, ctx.message());
+                forwardClientMessage(dg, ctx, ctx.message());
             }
         });
 
