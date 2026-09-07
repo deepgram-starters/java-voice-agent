@@ -10,6 +10,11 @@ Click the button below to fork the repo:
 
 ## Local Development
 
+### Requirements
+
+- JDK 21 or later. Verify with `java --version`.
+- Maven 3.9 or later.
+
 ### Makefile (Recommended)
 
 ```bash

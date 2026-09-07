@@ -1,11 +1,12 @@
 /**
  * Java Voice Agent Starter - Backend Server
  *
- * Simple WebSocket proxy to Deepgram's Voice Agent API using Javalin.
- * Forwards all messages (JSON and binary) bidirectionally between client and Deepgram.
+ * Simple WebSocket bridge to Deepgram's Voice Agent API using Javalin, backed
+ * by the official Deepgram Java SDK (`client.agent().v1().v1WebSocket()`).
+ * Forwards messages (JSON and binary) bidirectionally between client and Deepgram.
  *
  * Key Features:
- * - WebSocket proxy to Deepgram Voice Agent API (agent.deepgram.com)
+ * - WebSocket bridge to Deepgram Voice Agent API via the Deepgram Java SDK
  * - JWT session authentication via WebSocket subprotocol
  * - Project metadata from deepgram.toml
  * - Graceful shutdown with connection tracking
@@ -13,7 +14,7 @@
  * Routes:
  *   GET  /api/session       - Issue signed session token
  *   GET  /api/metadata      - Project metadata from deepgram.toml
- *   WS   /api/voice-agent   - WebSocket proxy to Deepgram Agent API (auth required)
+ *   WS   /api/voice-agent   - WebSocket bridge to Deepgram Agent API (auth required)
  *   GET  /health            - Health check
  */
 package com.deepgram.starter;
@@ -21,19 +22,20 @@ package com.deepgram.starter;
 import com.auth0.jwt.JWT;
 import com.auth0.jwt.algorithms.Algorithm;
 import com.auth0.jwt.exceptions.JWTVerificationException;
+import com.deepgram.DeepgramClient;
+import com.deepgram.core.ObjectMappers;
+import com.deepgram.resources.agent.v1.websocket.V1WebSocketClient;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.toml.TomlMapper;
 import io.github.cdimascio.dotenv.Dotenv;
 import io.javalin.Javalin;
 import io.javalin.websocket.WsConfig;
 import io.javalin.websocket.WsContext;
-import org.eclipse.jetty.websocket.client.WebSocketClient;
-import org.eclipse.jetty.websocket.api.Session;
-import org.eclipse.jetty.websocket.api.StatusCode;
-import org.eclipse.jetty.websocket.api.annotations.*;
+import okio.ByteString;
 
 import java.io.File;
-import java.net.URI;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.security.SecureRandom;
 import java.time.Instant;
@@ -46,15 +48,15 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Main application class for the Java Voice Agent Starter.
- * Manages HTTP routes, WebSocket proxy, and server lifecycle.
+ * Manages HTTP routes, WebSocket bridge, and server lifecycle.
  */
 public class App {
 
     /** Deepgram API key for authenticating upstream connections. */
     private static String deepgramApiKey;
 
-    /** Deepgram Voice Agent WebSocket URL. */
-    private static final String DEEPGRAM_AGENT_URL = "wss://agent.deepgram.com/v1/agent/converse";
+    /** Shared Deepgram SDK client; the browser never sees the API key. */
+    private static DeepgramClient deepgram;
 
     /** Server port, configurable via PORT environment variable. */
     private static int port;
@@ -74,14 +76,35 @@ public class App {
     /** Tracks all active client WebSocket contexts for graceful shutdown. */
     private static final Set<WsContext> activeConnections = ConcurrentHashMap.newKeySet();
 
-    /** Tracks Deepgram sessions keyed by client WsContext for cleanup. */
-    private static final Map<WsContext, DeepgramSession> deepgramSessions = new ConcurrentHashMap<>();
+    /** Tracks Deepgram agent websocket clients keyed by client WsContext for cleanup. */
+    private static final Map<WsContext, V1WebSocketClient> deepgramSessions = new ConcurrentHashMap<>();
 
-    /** Shared Jetty WebSocket client for outbound Deepgram connections. */
-    private static WebSocketClient wsClient;
-
-    /** Jackson ObjectMapper for JSON serialization. */
+    /** Jackson ObjectMapper for local JSON serialization (metadata, error messages). */
     private static final ObjectMapper jsonMapper = new ObjectMapper();
+
+    /** Parses browser JSON to a tree for the SDK's raw-send path. */
+    private static final ObjectMapper agentMapper = ObjectMappers.JSON_MAPPER;
+
+    /**
+     * Reflective handle to the SDK's private {@code V1WebSocketClient.sendMessage(Object)},
+     * which serializes an arbitrary object with the SDK's own mapper and writes it
+     * on the underlying (reconnecting) socket. We reuse this raw send path to
+     * forward the browser's control messages <em>verbatim</em> (see
+     * {@link #forwardClientMessage}); the SDK exposes no public raw-send method.
+     */
+    private static final Method DG_SEND_MESSAGE = resolveDgSendMessage();
+
+    private static Method resolveDgSendMessage() {
+        try {
+            Method m = V1WebSocketClient.class.getDeclaredMethod("sendMessage", Object.class);
+            m.setAccessible(true);
+            return m;
+        } catch (Exception e) {
+            System.err.println("WARNING: could not resolve V1WebSocketClient.sendMessage(Object); "
+                    + "client control messages cannot be forwarded verbatim: " + e.getMessage());
+            return null;
+        }
+    }
 
     // ============================================================================
     // SESSION AUTH - JWT tokens for production security
@@ -171,131 +194,61 @@ public class App {
         return 1000;
     }
 
-    // ============================================================================
-    // DEEPGRAM WEBSOCKET SESSION
-    // ============================================================================
+    /**
+     * Forwards a JSON control message from the client to the Deepgram agent
+     * websocket <em>verbatim</em>.
+     *
+     * <p>The message is serialized straight from the parsed JSON tree, not
+     * round-tripped through the SDK's typed protocol classes (e.g.
+     * {@code AgentV1Settings}). Those types re-emit their own constant
+     * {@code type} discriminator <em>and</em> the incoming {@code type} they
+     * captured in their additional-properties bag, so a round trip produces a
+     * <b>duplicate {@code type}</b> key (at the top level and at nested union
+     * variants such as {@code agent.listen.provider}). Deepgram rejects such a
+     * payload with {@code UNPARSABLE_CLIENT_MESSAGE} and never emits
+     * {@code SettingsApplied}. Forwarding the browser's JSON as-is preserves the
+     * exact wire payload (a single {@code type} at every level) and honors the
+     * transparent-proxy contract, where the browser owns the agent protocol.
+     *
+     * @param dg      the Deepgram agent websocket client
+     * @param ctx     the browser websocket context
+     * @param message the raw JSON text received from the browser
+     */
+    private static void forwardClientMessage(V1WebSocketClient dg, WsContext ctx, String message) {
+        try {
+            JsonNode node = agentMapper.readTree(message);
+            if (!node.isObject()) {
+                sendClientError(ctx, "Client message must be a JSON object", "INVALID_CLIENT_MESSAGE");
+                return;
+            }
+            if (DG_SEND_MESSAGE == null) {
+                System.err.println("Cannot forward client message; SDK raw-send path unavailable");
+                sendClientError(ctx, "Deepgram connection is unavailable", "CONNECTION_FAILED");
+                return;
+            }
+            // Hand the SDK's raw send path the parsed JSON tree so it serializes
+            // it verbatim (no typed re-serialization, no duplicated `type`).
+            DG_SEND_MESSAGE.invoke(dg, node);
+        } catch (Exception e) {
+            System.err.println("Error forwarding client message to Deepgram: " + e.getMessage());
+            sendClientError(ctx, "Failed to forward client message", "PROVIDER_ERROR");
+        }
+    }
 
     /**
-     * Jetty WebSocket endpoint that connects to Deepgram's Voice Agent API.
-     * Forwards all messages bidirectionally between the client and Deepgram.
+     * Sends an Error control message to the browser using the same shape the
+     * previous raw proxy produced, so the frontend needs no changes.
      */
-    @WebSocket
-    public static class DeepgramSession {
-        private WsContext clientCtx;
-        private Session deepgramSession;
-
-        public DeepgramSession() {}
-
-        /**
-         * Sets the client context for bidirectional message forwarding.
-         *
-         * @param ctx the Javalin WebSocket context
-         */
-        public void setClientContext(WsContext ctx) {
-            this.clientCtx = ctx;
+    private static void sendClientError(WsContext ctx, String description, String code) {
+        try {
+            Map<String, String> errorMsg = Map.of(
+                    "type", "Error",
+                    "description", description != null ? description : "Deepgram connection error",
+                    "code", code);
+            ctx.send(jsonMapper.writeValueAsString(errorMsg));
+        } catch (Exception e) {
+            System.err.println("Error sending error to client: " + e.getMessage());
         }
-
-        @OnWebSocketConnect
-        public void onOpen(Session session) {
-            this.deepgramSession = session;
-            System.out.println("Connected to Deepgram Agent API");
-        }
-
-        @OnWebSocketMessage
-        public void onTextMessage(Session session, String message) {
-            // Forward JSON messages from Deepgram to client
-            if (clientCtx != null) {
-                try {
-                    clientCtx.send(message);
-                } catch (Exception e) {
-                    System.err.println("Error forwarding text to client: " + e.getMessage());
-                }
-            }
-        }
-
-        @OnWebSocketMessage
-        public void onBinaryMessage(byte[] payload, int offset, int len) {
-            // Forward binary audio from Deepgram to client
-            if (clientCtx != null) {
-                try {
-                    byte[] data = new byte[len];
-                    System.arraycopy(payload, offset, data, 0, len);
-                    clientCtx.send(ByteBuffer.wrap(data));
-                } catch (Exception e) {
-                    System.err.println("Error forwarding binary to client: " + e.getMessage());
-                }
-            }
-        }
-
-        @OnWebSocketError
-        public void onError(Session session, Throwable cause) {
-            System.err.println("Deepgram WebSocket error: " + cause.getMessage());
-            if (clientCtx != null) {
-                try {
-                    Map<String, String> errorMsg = Map.of(
-                            "type", "Error",
-                            "description", cause.getMessage() != null ? cause.getMessage() : "Deepgram connection error",
-                            "code", "PROVIDER_ERROR"
-                    );
-                    clientCtx.send(jsonMapper.writeValueAsString(errorMsg));
-                } catch (Exception e) {
-                    System.err.println("Error sending error to client: " + e.getMessage());
-                }
-            }
-        }
-
-        @OnWebSocketClose
-        public void onClose(int statusCode, String reason) {
-            System.out.println("Deepgram connection closed: " + statusCode + " " + (reason != null ? reason : ""));
-            if (clientCtx != null) {
-                try {
-                    int safeCode = getSafeCloseCode(statusCode);
-                    clientCtx.closeSession(safeCode, reason != null ? reason : "");
-                } catch (Exception e) {
-                    System.err.println("Error closing client connection: " + e.getMessage());
-                }
-            }
-        }
-
-        /**
-         * Sends a text message to Deepgram.
-         *
-         * @param message the text message to send
-         */
-        public void sendText(String message) {
-            if (deepgramSession != null && deepgramSession.isOpen()) {
-                try {
-                    deepgramSession.getRemote().sendString(message);
-                } catch (Exception e) {
-                    System.err.println("Error sending text to Deepgram: " + e.getMessage());
-                }
-            }
-        }
-
-        /**
-         * Sends binary data to Deepgram.
-         *
-         * @param data the binary data to send
-         */
-        public void sendBinary(ByteBuffer data) {
-            if (deepgramSession != null && deepgramSession.isOpen()) {
-                try {
-                    deepgramSession.getRemote().sendBytes(data);
-                } catch (Exception e) {
-                    System.err.println("Error sending binary to Deepgram: " + e.getMessage());
-                }
-            }
-        }
-
-        /**
-         * Closes the Deepgram connection.
-         */
-        public void close() {
-            if (deepgramSession != null && deepgramSession.isOpen()) {
-                deepgramSession.close(StatusCode.NORMAL, "Client disconnected");
-            }
-        }
-
     }
 
     // ============================================================================
@@ -324,13 +277,13 @@ public class App {
     }
 
     // ============================================================================
-    // WEBSOCKET PROXY HANDLER
+    // WEBSOCKET BRIDGE HANDLER
     // ============================================================================
 
     /**
-     * Configures the WebSocket proxy endpoint for voice agent connections.
-     * Validates JWT auth, establishes upstream Deepgram connection, and
-     * forwards all messages bidirectionally.
+     * Configures the WebSocket bridge endpoint for voice agent connections.
+     * Validates JWT auth, establishes an upstream Deepgram agent connection via
+     * the SDK, and forwards messages bidirectionally.
      *
      * @param ws the Javalin WebSocket configuration
      */
@@ -349,62 +302,104 @@ public class App {
             activeConnections.add(ctx);
 
             try {
-                // Create Deepgram session handler
-                DeepgramSession dgSession = new DeepgramSession();
-                dgSession.setClientContext(ctx);
-                deepgramSessions.put(ctx, dgSession);
+                // Create the Deepgram agent websocket client for this connection
+                V1WebSocketClient dg = deepgram.agent().v1().v1WebSocket();
+                deepgramSessions.put(ctx, dg);
 
-                // Connect to Deepgram Voice Agent API with auth header
+                // Deepgram -> browser: forward every JSON event verbatim (before typed
+                // dispatch) so the frontend sees the exact agent protocol as before.
+                dg.onMessage(raw -> {
+                    try {
+                        if (ctx.session.isOpen()) {
+                            ctx.send(raw);
+                        }
+                    } catch (Exception e) {
+                        System.err.println("Error forwarding text to client: " + e.getMessage());
+                    }
+                });
+
+                // Deepgram -> browser: forward binary agent audio
+                dg.onAgentV1Audio(audio -> {
+                    try {
+                        if (ctx.session.isOpen()) {
+                            ctx.send(ByteBuffer.wrap(audio.toByteArray()));
+                        }
+                    } catch (Exception e) {
+                        System.err.println("Error forwarding binary to client: " + e.getMessage());
+                    }
+                });
+
+                dg.onConnected(() -> System.out.println("Connected to Deepgram Agent API"));
+
+                dg.onError(error -> {
+                    System.err.println("Deepgram WebSocket error: " + error.getMessage());
+                    if (ctx.session.isOpen()) {
+                        sendClientError(ctx, error.getMessage(), "PROVIDER_ERROR");
+                    }
+                });
+
+                dg.onDisconnected(reason -> {
+                    System.out.println("Deepgram connection closed: " + reason.getCode() + " "
+                            + (reason.getReason() != null ? reason.getReason() : ""));
+                    if (ctx.session.isOpen()) {
+                        try {
+                            ctx.closeSession(getSafeCloseCode(reason.getCode()),
+                                    reason.getReason() != null ? reason.getReason() : "");
+                        } catch (Exception e) {
+                            System.err.println("Error closing client connection: " + e.getMessage());
+                        }
+                    }
+                });
+
+                // Connect to the Deepgram Voice Agent API
                 System.out.println("Initiating Deepgram connection...");
-                org.eclipse.jetty.websocket.client.ClientUpgradeRequest request =
-                        new org.eclipse.jetty.websocket.client.ClientUpgradeRequest();
-                request.setHeader("Authorization", "Token " + deepgramApiKey);
-
-                wsClient.connect(dgSession, URI.create(DEEPGRAM_AGENT_URL), request);
+                dg.connect().whenComplete((v, err) -> {
+                    if (err != null) {
+                        System.err.println("Deepgram connection failed to open: " + err.getMessage());
+                        if (ctx.session.isOpen()) {
+                            sendClientError(ctx, "Failed to establish agent connection", "CONNECTION_FAILED");
+                            ctx.closeSession(1011, "Failed to connect to Deepgram");
+                        }
+                    }
+                });
             } catch (Exception e) {
-                System.err.println("Error setting up proxy: " + e.getMessage());
-                try {
-                    Map<String, String> errorMsg = Map.of(
-                            "type", "Error",
-                            "description", "Failed to establish proxy connection",
-                            "code", "CONNECTION_FAILED"
-                    );
-                    ctx.send(jsonMapper.writeValueAsString(errorMsg));
-                } catch (Exception ex) {
-                    System.err.println("Error sending error message: " + ex.getMessage());
-                }
+                System.err.println("Error setting up bridge: " + e.getMessage());
+                sendClientError(ctx, "Failed to establish agent connection", "CONNECTION_FAILED");
                 ctx.closeSession(1011, "Failed to connect to Deepgram");
+                deepgramSessions.remove(ctx);
                 activeConnections.remove(ctx);
             }
         });
 
-        // Forward text messages from client to Deepgram
+        // Forward text (control) messages from client to Deepgram
         ws.onMessage(ctx -> {
-            DeepgramSession dgSession = deepgramSessions.get(ctx);
-            if (dgSession != null) {
-                dgSession.sendText(ctx.message());
+            V1WebSocketClient dg = deepgramSessions.get(ctx);
+            if (dg != null) {
+                forwardClientMessage(dg, ctx, ctx.message());
             }
         });
 
-        // Forward binary messages from client to Deepgram
+        // Forward binary audio from client to Deepgram
         ws.onBinaryMessage(ctx -> {
-            DeepgramSession dgSession = deepgramSessions.get(ctx);
-            if (dgSession != null) {
+            V1WebSocketClient dg = deepgramSessions.get(ctx);
+            if (dg != null) {
                 byte[] data = ctx.data();
                 int offset = ctx.offset();
                 int length = ctx.length();
-                byte[] bytes = new byte[length];
-                System.arraycopy(data, offset, bytes, 0, length);
-                dgSession.sendBinary(ByteBuffer.wrap(bytes));
+                try {
+                    dg.sendMedia(ByteString.of(data, offset, length));
+                } catch (Exception e) {
+                    System.err.println("Error sending audio to Deepgram: " + e.getMessage());
+                }
             }
         });
 
         // Handle client disconnect
         ws.onClose(ctx -> {
             System.out.println("Client disconnected: " + ctx.status() + " " + ctx.reason());
-            DeepgramSession dgSession = deepgramSessions.remove(ctx);
-            if (dgSession != null) {
-                dgSession.close();
+            V1WebSocketClient dg = deepgramSessions.remove(ctx);
+            if (dg != null) {
+                dg.disconnect();
             }
             activeConnections.remove(ctx);
         });
@@ -413,9 +408,9 @@ public class App {
         ws.onError(ctx -> {
             System.err.println("Client WebSocket error: " +
                     (ctx.error() != null ? ctx.error().getMessage() : "unknown"));
-            DeepgramSession dgSession = deepgramSessions.remove(ctx);
-            if (dgSession != null) {
-                dgSession.close();
+            V1WebSocketClient dg = deepgramSessions.remove(ctx);
+            if (dg != null) {
+                dg.disconnect();
             }
             activeConnections.remove(ctx);
         });
@@ -427,7 +422,7 @@ public class App {
 
     /**
      * Performs graceful shutdown: closes all active WebSocket connections
-     * and stops the Jetty WebSocket client.
+     * and disconnects all Deepgram agent sessions.
      *
      * @param signal the signal name that triggered shutdown
      */
@@ -444,21 +439,12 @@ public class App {
             }
         }
 
-        // Close all Deepgram sessions
-        for (DeepgramSession dgSession : deepgramSessions.values()) {
+        // Disconnect all Deepgram sessions
+        for (V1WebSocketClient dg : deepgramSessions.values()) {
             try {
-                dgSession.close();
+                dg.disconnect();
             } catch (Exception e) {
                 System.err.println("Error closing Deepgram session: " + e.getMessage());
-            }
-        }
-
-        // Stop the WebSocket client
-        if (wsClient != null) {
-            try {
-                wsClient.stop();
-            } catch (Exception e) {
-                System.err.println("Error stopping WebSocket client: " + e.getMessage());
             }
         }
 
@@ -470,7 +456,7 @@ public class App {
     // ============================================================================
 
     /**
-     * Application entry point. Loads configuration, initializes the Jetty WebSocket
+     * Application entry point. Loads configuration, initializes the Deepgram SDK
      * client, registers HTTP and WebSocket routes, and starts the Javalin server.
      *
      * @param args command-line arguments (unused)
@@ -489,6 +475,23 @@ public class App {
             System.exit(1);
         }
 
+        // Fail fast if the reflective raw-send handle could not be resolved.
+        // forwardClientMessage relies on the SDK's private
+        // V1WebSocketClient.sendMessage(Object) to forward the browser's control
+        // messages (including the initial Settings) verbatim. Without it the
+        // server would still start and audio would flow, but Settings would
+        // never be forwarded, so the agent would never be configured and never
+        // speak — a silent failure. Refuse to start instead. (See S2: the typed
+        // public senders emit a duplicated `type` the agent rejects, which is
+        // why this reflection exists; remove it once the SDK exposes a public
+        // raw/verbatim send.)
+        if (DG_SEND_MESSAGE == null) {
+            System.err.println("ERROR: could not resolve the SDK's V1WebSocketClient.sendMessage(Object); "
+                    + "client control messages cannot be forwarded. This usually means the pinned "
+                    + "deepgram-java-sdk version changed that method's name/signature.");
+            System.exit(1);
+        }
+
         // Load optional configuration
         String portStr = dotenv.get("PORT", "8081");
         port = Integer.parseInt(portStr);
@@ -499,14 +502,8 @@ public class App {
             sessionSecret = generateSessionSecret();
         }
 
-        // Initialize Jetty WebSocket client for outbound Deepgram connections
-        wsClient = new WebSocketClient();
-        try {
-            wsClient.start();
-        } catch (Exception e) {
-            System.err.println("Failed to start WebSocket client: " + e.getMessage());
-            System.exit(1);
-        }
+        // Initialize the Deepgram SDK client for outbound agent connections
+        deepgram = DeepgramClient.builder().apiKey(deepgramApiKey).build();
 
         // Create Javalin app with CORS enabled
         Javalin app = Javalin.create(config -> {
@@ -549,7 +546,7 @@ public class App {
         // WEBSOCKET ROUTES
         // ====================================================================
 
-        // WS /api/voice-agent - WebSocket proxy to Deepgram Agent API
+        // WS /api/voice-agent - WebSocket bridge to Deepgram Agent API
         app.ws("/api/voice-agent", App::voiceAgentWebSocket);
 
         // ====================================================================

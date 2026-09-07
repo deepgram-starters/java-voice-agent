@@ -6,7 +6,7 @@ repository = "https://github.com/deepgram-starters/java-voice-agent"
 useCase = "voice-agent"
 language = "Java"
 framework = "Javalin"
-sdk = "N/A"
+sdk = "deepgram-java-sdk"
 tags = ["voice-agent", "conversational-ai", "voice-ai", "voice-bot", "java", "javalin"]
 
 [check]
